@@ -306,33 +306,71 @@ No sandbox:render message received yet.</pre
                         sentAt: new Date().toISOString(),
                     };
 
+                    // Serialize once so we can both send AND show the exact
+                    // bytes that leave the page.
+                    var sentBody = stringify(payload);
+                    console.log('[webhook] POST body sent:', sentBody);
+
                     window
                         .fetch(WEBHOOK_URL, {
                             method: 'POST',
                             headers: {
                                 'Content-Type': 'application/json',
                             },
-                            body: stringify(payload),
+                            body: sentBody,
                         })
                         .then(function (response) {
-                            if (!response.ok) {
-                                throw new Error(
-                                    'Request failed with status ' +
-                                        response.status,
-                                );
-                            }
+                            // Read the response text regardless of status so
+                            // we can display whatever the endpoint returns.
+                            return response.text().then(function (text) {
+                                return { response: response, text: text };
+                            });
+                        })
+                        .then(function (result) {
+                            var response = result.response;
+                            console.log(
+                                '[webhook] HTTP status:',
+                                response.status,
+                                response.statusText,
+                            );
+                            console.log(
+                                '[webhook] response body:',
+                                result.text,
+                            );
+
+                            var ok = response.ok;
                             fetchStatus.textContent =
-                                'Posted (status ' + response.status + ')';
-                            fetchStatus.className = 'status success';
-                            posts.textContent =
-                                'Payload sent to webhook.site. Check the ' +
-                                'webhook.site dashboard to inspect it.';
+                                (ok ? 'Posted' : 'Rejected') +
+                                ' — HTTP ' +
+                                response.status +
+                                (response.statusText
+                                    ? ' ' + response.statusText
+                                    : '');
+                            fetchStatus.className =
+                                'status ' + (ok ? 'success' : 'error');
+
+                            // Show exactly what was sent, plus what came back.
+                            posts.innerHTML = '';
+                            var sentBlock = document.createElement('pre');
+                            sentBlock.textContent =
+                                'Transport: request delivered (HTTP ' +
+                                response.status +
+                                ').\n\n--- Bytes sent to webhook ---\n' +
+                                sentBody +
+                                '\n\n--- Response body ---\n' +
+                                (result.text || '(empty)');
+                            posts.appendChild(sentBlock);
                             reportSize();
                         })
                         .catch(function (error) {
-                            fetchStatus.textContent = 'POST failed';
+                            // Only real transport failures land here
+                            // (network down, CORS, DNS, etc.).
+                            console.error('[webhook] transport error:', error);
+                            fetchStatus.textContent = 'Transport failed';
                             fetchStatus.className = 'status error';
-                            posts.textContent = error.message;
+                            posts.textContent =
+                                'The request itself did not go through: ' +
+                                error.message;
                             reportSize();
                         })
                         .finally(function () {
