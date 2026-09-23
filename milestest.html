@@ -208,6 +208,10 @@ No sandbox:render message received yet.</pre
                 var WEBHOOK_URL =
                     'https://webhook.site/a0ec687e-3863-44d9-a059-3f77b6a5f142';
 
+                // Max number of rows from data / comparisonData to include
+                // in the POST body. Keeps the request under webhook size caps.
+                var ROW_LIMIT = 50;
+
                 var requestParentButton =
                     document.getElementById('request-parent');
                 var fetchPostsButton = document.getElementById('fetch-posts');
@@ -246,6 +250,45 @@ No sandbox:render message received yet.</pre
                     } catch (error) {
                         return 'Unable to display payload: ' + error.message;
                     }
+                }
+
+                // Returns a shallow copy of the payload with the data and
+                // comparisonData arrays trimmed to the first ROW_LIMIT rows.
+                // All other fields are passed through untouched.
+                function capPayload(payload, limit) {
+                    if (!payload || typeof payload !== 'object') {
+                        return payload;
+                    }
+
+                    var capped = {};
+                    Object.keys(payload).forEach(function (key) {
+                        var value = payload[key];
+                        if (
+                            (key === 'data' || key === 'comparisonData') &&
+                            Array.isArray(value)
+                        ) {
+                            capped[key] = value.slice(0, limit);
+                        } else {
+                            capped[key] = value;
+                        }
+                    });
+
+                    // Record how much was dropped, for transparency.
+                    var dataLen = Array.isArray(payload.data)
+                        ? payload.data.length
+                        : 0;
+                    var compLen = Array.isArray(payload.comparisonData)
+                        ? payload.comparisonData.length
+                        : 0;
+                    if (dataLen > limit || compLen > limit) {
+                        capped._truncated = {
+                            rowLimit: limit,
+                            originalDataRows: dataLen,
+                            originalComparisonRows: compLen,
+                        };
+                    }
+
+                    return capped;
                 }
 
                 function requestParentData() {
@@ -306,9 +349,13 @@ No sandbox:render message received yet.</pre
                         sentAt: new Date().toISOString(),
                     };
 
+                    // Cap to the first ROW_LIMIT rows so the body stays
+                    // under the webhook's size limit.
+                    var cappedPayload = capPayload(payload, ROW_LIMIT);
+
                     // Serialize once so we can both send AND show the exact
                     // bytes that leave the page.
-                    var sentBody = stringify(payload);
+                    var sentBody = stringify(cappedPayload);
                     console.log('[webhook] POST body sent:', sentBody);
 
                     window
